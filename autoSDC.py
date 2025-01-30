@@ -1,39 +1,56 @@
-# from concurrent.futures import thread
 from dataclasses import dataclass
 import serial
+import sys
 import threading
 import time
 
 ## Constants
+VERSION = "0.2"
 ONE_FRAME = 1 / 60  # 0.016666 s
 DEFAULT_SLEEP = 0.1  # s
 DEFAULT_SLEEP_LONG = 1
+LINE_TERMINATION = "\r\n"
 
 
 @dataclass(frozen=True)
 class Msg:
-    I_WELCOME = "Welcome to SDC corrosion demo v0.1"
+    I_WELCOME = "Welcome to SDC corrosion demo v0.2"
     I_KEYBOARD_INTERRUPT = "KeyboardInterrupt: Exiting..."
     I_CLEAN_EXIT = "Clean exit: Closed all ports"
+    I_START = "Enter command: "
     E_DEVICE_NOT_FOUND = "ERROR: One of the serial devices was not found; Check that you've set the correct device identifier for your platform. E.g. COM<x> on Windows, /dev/ttyACM<x> on Mac & Linux"
     W_LISTENER_THREAD_ALVIE = "WARNING: lisener_thread is still alive"
     E_INPUT_NOT_VALID = "ERROR: Input is not valid"
     E_SERIAL_PORT_NOT_REGISTERED = (
         "ERROR: The serial port for this device is not registered"
     )
+    E_PORT_NOT_AVAILABLE = "ERROR: Port is labeled active but is either not configured or not currently open."
+    E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE = (
+        "ERROR: Required devices for script are not active"
+    )
 
 
 ## Configure Serial connection
 
-ser_ls_z = serial.Serial()
-ser_ls_z.port = "/dev/ttyACM0"
-ser_ls_z.baudrate = 9600  # 9600
-ser_ls_z.bytesize = serial.EIGHTBITS
-ser_ls_z.parity = serial.PARITY_NONE
-ser_ls_z.stopbits = serial.STOPBITS_ONE
-ser_ls_z.timeout = 1
-assert (ser_ls_z.rts is True) and (ser_ls_z.dtr is True)
+ACTIVE_PORT_KEYS = ["p", "z"]
 
+# X Stage: Ossila
+ser_ls_x = None
+
+# Y Stage: Ossila
+ser_ls_y = None
+
+# Z Stage: Ossila 100mm
+ser_port = serial.Serial()
+ser_port.port = "/dev/ttyACM0"
+ser_port.baudrate = 9600  # 9600
+ser_port.bytesize = serial.EIGHTBITS
+ser_port.parity = serial.PARITY_NONE
+ser_port.stopbits = serial.STOPBITS_ONE
+ser_port.timeout = 1
+assert (ser_port.rts is True) and (ser_port.dtr is True)
+
+# Peristaltic pump: Reglo ICC
 ser_pump = serial.Serial()
 ser_pump.port = "/dev/ttyACM1"
 ser_pump.baudrate = 9600  # 9600
@@ -43,12 +60,14 @@ ser_pump.stopbits = serial.STOPBITS_ONE
 ser_pump.timeout = 1
 assert (ser_pump.rts is True) and (ser_pump.dtr is True)
 
-serial_ports: dict[str, serial.Serial | None] = {
-    "P:": ser_pump,
-    "X:": None,
-    "Y:": None,
-    "Z:": ser_ls_z,
+SERIAL_PORTS: dict[str, serial.Serial | None] = {
+    "p": ser_pump,
+    "x": ser_ls_x,
+    "y": ser_ls_y,
+    "z": ser_port,
 }
+
+
 ## Classess
 
 
@@ -83,122 +102,232 @@ class StoppableThread(threading.Thread):
 ## Scripts
 
 
-def script_demo(*args, stop_event: threading.Event = None):
-    print("Not Implemented!")
-
-
-def script_wiggle_ls(
-    serial_ports: dict[str, serial.Serial], *args, thread=StoppableThread
-):
+def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
+    if not all([check_port(serial_ports, key) for key in ("p", "z")]):
+        print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
+        return
     try:
-        thread.pause()
+        dist = int(args[0])
+        speed = 15  # mm/s
+        ser_ls_z = serial_ports["z"]
+        ser_pump = serial_ports["p"]
+
+        timeout_home = 10
+        timeout_move = dist / speed
+        s_name = "(demo) "
+
+        send_listen_print(ser_ls_z, "<home>", 2, timeout_home, s_name + "z")
+        send_listen_print(ser_pump, "@1", 1, 2, s_name + "p")
+        send_listen_print(ser_ls_z, f"<move {dist}>", 2, timeout_move, s_name + "z")
+        send_listen_print(ser_pump, "4H", 2, 5, s_name + "p")
+        send_listen_print(ser_ls_z, f"<move -{dist}>", 2, timeout_move, s_name + "z")
+
+        print(s_name + "Successful!")
+
+    finally:
+        print(s_name + "Exited")
+
+
+def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
+    try:
         port_code = args[0]
         dist = int(args[1])
+        if not check_port(serial_ports, port_code):
+            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
+            return
+
         serial_port = serial_ports[port_code]
 
-        send_command(serial_port, f"<move {dist}>")
+        timeout = 1.5
+        send_listen_print(serial_port, f"<move {dist}>", 2, timeout, "(script) ls")
 
-        while serial_port.in_waiting < 1:
-            time.sleep(DEFAULT_SLEEP)
-        data = ser_ls_z.read_until
-        for line in serial_port.readlines():
-            print(f"(script) Received: {line.decode()}")
-        # time.sleep(DEFAULT_SLEEP_LONG)
-
-        send_command(serial_port, f"<move -{dist}>")
-
-        # while serial_port.in_waiting < 1:
-        #     time.sleep(DEFAULT_SLEEP)
-
-        # for line in serial_port.readlines():
-        #     print(f"(script) Received: {line.decode()}")
+        send_listen_print(serial_port, f"<move -{dist}>", 2, timeout, "(script) ls")
 
         time.sleep(DEFAULT_SLEEP_LONG)
         print(f"wiggled {dist}mm !")
 
     finally:
-        thread.resume()
+        print("script_wiggle_ls exited")
 
 
-scripts = {"demo": script_demo, "wiggle_ls": script_wiggle_ls}
+def program_exit(*args):
+    """Exit the program"""
+    sys.exit()
+
+
+scripts = {
+    "demo": script_demo,
+    "wiggle_ls": script_wiggle_ls,
+    "exit": program_exit,
+    "quit": program_exit,
+}
 
 ## Functions
 
 
-def send_command(serial_port, command):
-    serial_port.write(command.encode())
-    print(f"Sent command: {command}")
+def send_command(serial_port: serial.Serial, command: str):
+    serial_port.write((command + LINE_TERMINATION).encode())
+    # print(f"Sent command: {command}")
 
 
 def check_port(serial_ports: dict[str, serial.Serial], serial_port_code: str):
+    """Check that the port is configured and open"""
+
     port = serial_ports[serial_port_code]
-    if port is None:
+    if port is None:  # Not configured
         return False
-    else:
+
+    else:  # Configured; Check whether port is open
         return port.is_open
+
+
+def listen_for(serial_port: serial.Serial, number_of_lines: int, timeout: float):
+    # wait until first data byte arrives
+    start_time = time.time()
+
+    current_time = time.time()
+    lines = []
+    while current_time - start_time < timeout and len(lines) < number_of_lines:
+        if serial_port.in_waiting > 0:
+            data = serial_port.readline().decode().strip()
+            lines.append(data)
+        time.sleep(ONE_FRAME)
+        current_time = time.time()
+
+    return lines
+
+
+def send_and_listen(
+    serial_port: serial.Serial, command: str, number_of_lines: int, timeout: float
+):
+    send_command(serial_port, command)
+    return listen_for(serial_port, number_of_lines, timeout)
+
+
+def print_lines(prefix: str, lines: list):
+    for line in lines:
+        print(f"{prefix}: {line}")
+
+
+def send_listen_print(
+    serial_port: serial.Serial,
+    command: str,
+    number_of_lines: int,
+    timeout: float,
+    prefix: str,
+):
+    response_lines = send_and_listen(serial_port, command, number_of_lines, timeout)
+    print_lines(prefix, response_lines)
+    return response_lines
 
 
 ## Listener thread
 
 
-def listen_for_data(stop_event: threading.Event, resume_event: threading.Event):
+def listen_for_data(
+    stop_event: threading.Event,
+    resume_event: threading.Event,
+    all_serial_ports: dict[str, serial.Serial] = None,
+    active_port_keys: list[str] = None,
+):
     """Reads serial data in a loop until stop_event is set. Pauses when pause_event is cleared."""
+    serial_ports = [all_serial_ports[port] for port in active_port_keys]
+
     while not stop_event.is_set():
         resume_event.wait()  # Pause execution while resuume_event is cleared
 
-        if ser_ls_z.in_waiting > 0:
-            data = ser_ls_z.readline().decode("utf-8")  # .strip()
-            print(f"Received: {data}")
+        for serial_port, port_key in zip(serial_ports, active_port_keys):
+            if serial_port.in_waiting > 0:
+                data = serial_port.readline().decode("utf-8").strip()
+                print(f"{port_key}: {data}")
 
-        time.sleep(DEFAULT_SLEEP)  # Prevent high CPU usage
+        time.sleep(ONE_FRAME)  # Prevent high CPU usage
 
-
-# listener_stop_event = threading.Event()
-# listener_thread = threading.Thread(target=listen_for_data, args=(listener_stop_event,))
-
-listener_thread = StoppableThread(target=listen_for_data)
 
 ## Main function
+
+
+def setup(
+    serial_ports: dict[str, serial.Serial],
+    active_ports: list[str],
+    listener: StoppableThread,
+) -> None:
+    """Open the serial ports and start listening."""
+    try:
+        for port_code in active_ports:
+            serial_ports[port_code].open()
+
+    except serial.SerialException:
+        print(Msg.E_DEVICE_NOT_FOUND)
+        raise
+
+    listener.start()
+
+
+def clean_up(
+    serial_ports: dict[str, serial.Serial],
+    active_ports: list[str],
+    listener: StoppableThread,
+) -> None:
+    """Clean up serial port connections"""
+    listener.stop()
+    if listener.is_alive():
+        listener.join(timeout=5)
+        if listener.is_alive():
+            print(Msg.W_LISTENER_THREAD_ALVIE)
+
+    for port_code in active_ports:
+        serial_ports[port_code].close
 
 
 def main():
     try:
         print(Msg.I_WELCOME)
-
-        try:
-            ser_ls_z.open()
-            ser_pump.open()
-
-        except serial.SerialException:
-            print(Msg.E_DEVICE_NOT_FOUND)
-            raise
-
-        listener_thread.start()
+        # serial_ports = [SERIAL_PORTS[port_code] for port_code in ACTIVE_PORTS]
+        listener_thread = StoppableThread(
+            target=listen_for_data,
+            all_serial_ports=SERIAL_PORTS,
+            active_port_keys=ACTIVE_PORT_KEYS,
+        )
+        setup(SERIAL_PORTS, ACTIVE_PORT_KEYS, listener_thread)
+        print(Msg.I_START)
 
         while True:
-            user_input = input("Enter command: ")
+            user_input = input()
 
             # Invalid input
-            if len(user_input) < 2:
+            if len(user_input) < 1:
                 print(Msg.E_INPUT_NOT_VALID)
 
-            # Check for port codes
-            elif (port_code := user_input[0:2]) in serial_ports:
-                if check_port(serial_ports, port_code):
-                    ser_port = serial_ports[port_code]
+            user_input = user_input.strip()  # .split(' ')
+            input_code = user_input[0].lower()
+
+            # If input_code is a valid active port: Send commands directly
+            if input_code in ACTIVE_PORT_KEYS:
+                # Check that the port is open
+                if check_port(SERIAL_PORTS, input_code):
+                    ser_port = SERIAL_PORTS[input_code]
                     send_command(ser_port, user_input[2:])
                 else:
-                    print(Msg.E_SERIAL_PORT_NOT_REGISTERED)
+                    raise LookupError(Msg.E_PORT_NOT_AVAILABLE)
 
+            # If input_code is valid but port is not configured: Inform user
+            elif input_code in SERIAL_PORTS:
+                print(Msg.E_SERIAL_PORT_NOT_REGISTERED)
+
+            # Otherwise, input must either be a script or invalid
             else:
                 user_input_list = user_input.split(" ")
                 keyword = user_input_list[0]
                 arguments = user_input_list[1:]
 
                 if keyword in scripts:
-                    scripts[keyword](
-                        serial_ports, *arguments, threads=[listener_thread]
-                    )
+                    try:
+                        listener_thread.pause()
+                        scripts[keyword](SERIAL_PORTS, ACTIVE_PORT_KEYS, *arguments)
+
+                    finally:
+                        listener_thread.resume()
 
                 else:
                     print(Msg.E_INPUT_NOT_VALID)
@@ -206,18 +335,11 @@ def main():
             time.sleep(DEFAULT_SLEEP)
 
     except KeyboardInterrupt:
-        print(Msg.I_KEYBOARD_INTERRUPT)
+        print("")
+        program_exit()
 
     finally:
-        # listener_stop_event.set()
-        listener_thread.stop()
-        if listener_thread.is_alive():
-            listener_thread.join(timeout=5)
-            if listener_thread.is_alive():
-                print(Msg.W_LISTENER_THREAD_ALVIE)
-
-        ser_ls_z.close()
-        ser_pump.close()
+        clean_up(SERIAL_PORTS, ACTIVE_PORT_KEYS, listener_thread)
         print(Msg.I_CLEAN_EXIT)
 
 
