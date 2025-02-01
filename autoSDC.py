@@ -5,11 +5,12 @@ import threading
 import time
 
 ## Constants
-VERSION = "0.2"
+VERSION = "0.3"
 ONE_FRAME = 1 / 60  # 0.016666 s
 DEFAULT_SLEEP = 0.1  # s
 DEFAULT_SLEEP_LONG = 1
 LINE_TERMINATION = "\r\n"
+LS_SPEED_DEFAULT = 15  # mm/s Default max speed of linear stage
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class Msg:
 
 ## Configure Serial connection
 
-ACTIVE_PORT_KEYS = ["p", "z"]
+ACTIVE_PORT_KEYS = ["p", "z"]  # Tell the script which ports to activate and use
 
 # X Stage: Ossila
 ser_ls_x = None
@@ -73,6 +74,11 @@ SERIAL_PORTS: dict[str, serial.Serial | None] = {
 
 class StoppableThread(threading.Thread):
     def __init__(self, target, *args, **kwargs):
+        """Thread that checks for a stop and a resume event.
+
+        Terminates on stop and toggles on pause/resume.
+        """
+
         super().__init__()
         self._target = target
         self._args = args
@@ -103,24 +109,26 @@ class StoppableThread(threading.Thread):
 
 
 def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
-    if not all([check_port(serial_ports, key) for key in ("p", "z")]):
-        print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
-        return
+    """Demo 2025-02-03: Move linear stage, run pump, move stage back"""
+
     try:
+        if not all([check_port(serial_ports, key) for key in ("p", "z")]):
+            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
+            return
+
         dist = int(args[0])
-        speed = 15  # mm/s
         ser_ls_z = serial_ports["z"]
         ser_pump = serial_ports["p"]
 
         timeout_home = 10
-        timeout_move = dist / speed
+        timeout_move = dist / LS_SPEED_DEFAULT
         s_name = "(demo) "
 
-        send_listen_print(ser_ls_z, "<home>", 2, timeout_home, s_name + "z")
-        send_listen_print(ser_pump, "@1", 1, 2, s_name + "p")
-        send_listen_print(ser_ls_z, f"<move {dist}>", 2, timeout_move, s_name + "z")
-        send_listen_print(ser_pump, "4H", 2, 5, s_name + "p")
-        send_listen_print(ser_ls_z, f"<move -{dist}>", 2, timeout_move, s_name + "z")
+        send_and_listen(ser_ls_z, "<home>", 2, timeout_home, s_name + "z")
+        send_and_listen(ser_pump, "@1", 1, 2, s_name + "p")
+        send_and_listen(ser_ls_z, f"<move {dist}>", 2, timeout_move, s_name + "z")
+        send_and_listen(ser_pump, "4H", 2, 5, s_name + "p")
+        send_and_listen(ser_ls_z, f"<move -{dist}>", 2, timeout_move, s_name + "z")
 
         print(s_name + "Successful!")
 
@@ -129,6 +137,7 @@ def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args)
 
 
 def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
+    """Move the linear stage back and forth"""
     try:
         port_code = args[0]
         dist = int(args[1])
@@ -136,18 +145,19 @@ def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *
             print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
             return
 
+        s_name = "(wiggle_ls) "
+        prefix = s_name + port_code
         serial_port = serial_ports[port_code]
 
-        timeout = 1.5
-        send_listen_print(serial_port, f"<move {dist}>", 2, timeout, "(script) ls")
+        timeout = dist / LS_SPEED_DEFAULT
 
-        send_listen_print(serial_port, f"<move -{dist}>", 2, timeout, "(script) ls")
+        send_and_listen(serial_port, f"<move {dist}>", 2, timeout, prefix)
+        send_and_listen(serial_port, f"<move -{dist}>", 2, timeout, prefix)
 
-        time.sleep(DEFAULT_SLEEP_LONG)
-        print(f"wiggled {dist}mm !")
+        print(s_name + f"Wiggled {port_code} {dist}mm !")
 
     finally:
-        print("script_wiggle_ls exited")
+        print(s_name + "Exited")
 
 
 def program_exit(*args):
@@ -165,11 +175,6 @@ scripts = {
 ## Functions
 
 
-def send_command(serial_port: serial.Serial, command: str):
-    serial_port.write((command + LINE_TERMINATION).encode())
-    # print(f"Sent command: {command}")
-
-
 def check_port(serial_ports: dict[str, serial.Serial], serial_port_code: str):
     """Check that the port is configured and open"""
 
@@ -181,16 +186,31 @@ def check_port(serial_ports: dict[str, serial.Serial], serial_port_code: str):
         return port.is_open
 
 
-def listen_for(serial_port: serial.Serial, number_of_lines: int, timeout: float):
-    # wait until first data byte arrives
-    start_time = time.time()
+def send_command(serial_port: serial.Serial, command: str):
+    """Encode and send the given string over a serial port"""
+    serial_port.write((command + LINE_TERMINATION).encode())
+    # print(f"Sent command: {command}")
 
+
+def listen_for(
+    serial_port: serial.Serial,
+    number_of_lines: int,
+    timeout: float,
+    print_lines: bool = True,
+    prefix: str = "",
+):
+    """Read a specified number of lines with a timeout from serial"""
+
+    start_time = time.time()
     current_time = time.time()
+
     lines = []
     while current_time - start_time < timeout and len(lines) < number_of_lines:
         if serial_port.in_waiting > 0:
             data = serial_port.readline().decode().strip()
             lines.append(data)
+            if print_lines:
+                print(f"{prefix}: {data}")
         time.sleep(ONE_FRAME)
         current_time = time.time()
 
@@ -198,27 +218,18 @@ def listen_for(serial_port: serial.Serial, number_of_lines: int, timeout: float)
 
 
 def send_and_listen(
-    serial_port: serial.Serial, command: str, number_of_lines: int, timeout: float
-):
-    send_command(serial_port, command)
-    return listen_for(serial_port, number_of_lines, timeout)
-
-
-def print_lines(prefix: str, lines: list):
-    for line in lines:
-        print(f"{prefix}: {line}")
-
-
-def send_listen_print(
     serial_port: serial.Serial,
     command: str,
     number_of_lines: int,
     timeout: float,
-    prefix: str,
+    prefix: str = "",
+    print_lines: bool = True,
 ):
-    response_lines = send_and_listen(serial_port, command, number_of_lines, timeout)
-    print_lines(prefix, response_lines)
-    return response_lines
+    """Send command over serial and read a specified number of lines from serial"""
+    send_command(serial_port, command)
+    return listen_for(
+        serial_port, number_of_lines, timeout, print_lines=print_lines, prefix=prefix
+    )
 
 
 ## Listener thread
