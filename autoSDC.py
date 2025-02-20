@@ -1,8 +1,10 @@
-from dataclasses import dataclass
-import serial
 import sys
 import threading
 import time
+from dataclasses import dataclass
+from typing import final
+
+import serial
 
 ## Constants
 VERSION = "0.3"
@@ -13,6 +15,7 @@ LINE_TERMINATION = "\r\n"
 LS_SPEED_DEFAULT = 15  # mm/s Default max speed of linear stage
 
 
+@final
 @dataclass(frozen=True)
 class Msg:
     I_WELCOME = "Welcome to SDC corrosion demo v0.2"
@@ -36,20 +39,34 @@ class Msg:
 ACTIVE_PORT_KEYS = ["p", "z"]  # Tell the script which ports to activate and use
 
 # X Stage: Ossila
-ser_ls_x = None
+ser_ls_x = serial.Serial()
+ser_ls_x.port = "/dev/ttyACM?"
+ser_ls_x.baudrate = 9600  # 9600
+ser_ls_x.bytesize = serial.EIGHTBITS
+ser_ls_x.parity = serial.PARITY_NONE
+ser_ls_x.stopbits = serial.STOPBITS_ONE
+ser_ls_x.timeout = 1
+assert (ser_ls_x.rts is True) and (ser_ls_x.dtr is True)
 
 # Y Stage: Ossila
-ser_ls_y = None
+ser_ls_y = serial.Serial()
+ser_ls_y.port = "/dev/ttyACM?"
+ser_ls_y.baudrate = 9600  # 9600
+ser_ls_y.bytesize = serial.EIGHTBITS
+ser_ls_y.parity = serial.PARITY_NONE
+ser_ls_y.stopbits = serial.STOPBITS_ONE
+ser_ls_y.timeout = 1
+assert (ser_ls_y.rts is True) and (ser_ls_y.dtr is True)
 
 # Z Stage: Ossila 100mm
-ser_port = serial.Serial()
-ser_port.port = "/dev/ttyACM0"
-ser_port.baudrate = 9600  # 9600
-ser_port.bytesize = serial.EIGHTBITS
-ser_port.parity = serial.PARITY_NONE
-ser_port.stopbits = serial.STOPBITS_ONE
-ser_port.timeout = 1
-assert (ser_port.rts is True) and (ser_port.dtr is True)
+ser_ls_z = serial.Serial()
+ser_ls_z.port = "/dev/ttyACM0"
+ser_ls_z.baudrate = 9600  # 9600
+ser_ls_z.bytesize = serial.EIGHTBITS
+ser_ls_z.parity = serial.PARITY_NONE
+ser_ls_z.stopbits = serial.STOPBITS_ONE
+ser_ls_z.timeout = 1
+assert (ser_ls_z.rts is True) and (ser_ls_z.dtr is True)
 
 # Peristaltic pump: Reglo ICC
 ser_pump = serial.Serial()
@@ -65,13 +82,14 @@ SERIAL_PORTS: dict[str, serial.Serial | None] = {
     "p": ser_pump,
     "x": ser_ls_x,
     "y": ser_ls_y,
-    "z": ser_port,
+    "z": ser_ls_z,
 }
 
 
 ## Classess
 
 
+@final
 class StoppableThread(threading.Thread):
     def __init__(self, target, *args, **kwargs):
         """Thread that checks for a stop and a resume event.
