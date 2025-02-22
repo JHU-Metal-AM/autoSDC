@@ -1,3 +1,4 @@
+# pyright: basic
 import sys
 import threading
 import time
@@ -126,9 +127,109 @@ class StoppableThread(threading.Thread):
 ## Scripts
 
 
+def script_demo2(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
+    """Demo 2025-02-20: Move linear stage, run pump, move stage back"""
+    s_name = "(demo2) "
+    try:
+        if not all([check_port(serial_ports, key) for key in ("x", "y", "z", "p")]):
+            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
+            return
+
+        ser_ls_x = serial_ports["x"]
+        ser_ls_y = serial_ports["y"]
+        ser_ls_z = serial_ports["z"]
+        ser_pump = serial_ports["p"]
+
+        timeout_home = 10
+
+        x_retract = 0
+        y_retract = 0
+        z_retract = 0  # or 100?
+
+        x_measure = 20
+        y_measure = 60
+        z_measure = 30
+
+        z_s_approach = 5
+
+        ## "Home" the stages
+        send_command(ser_ls_z, "<home>")
+        send_command(ser_ls_x, "<home>")
+        send_command(ser_ls_y, "<home>")
+
+        time.sleep(timeout_home)
+
+        ## Move stages into retracted position
+        send_command(ser_ls_z, f"<goto {z_retract}>")
+        send_command(ser_ls_x, f"<goto {x_retract}>")
+        send_command(ser_ls_y, f"<goto {y_retract}>")
+
+        time.sleep(z_retract / LS_SPEED_DEFAULT)
+
+        ## Move sample into position
+        send_command(ser_ls_x, f"<goto {x_measure}>")
+        send_command(ser_ls_y, f"<goto {y_measure}>")
+
+        time.sleep(max(x_measure, y_measure) / LS_SPEED_DEFAULT)
+
+        # Move z into position
+        send_command(ser_ls_z, f"<goto {z_measure} {z_s_approach}")
+
+        time.sleep(abs(z_measure - z_retract) / z_s_approach)
+
+        ## Prep pumps
+        # Run channel 2 CCW, fast, 5 seconds
+        # Run channel 4 CW, slowly, 5 seconds
+        send_and_listen(
+            ser_pump, "@1", 1, 2, s_name + "p"
+        )  # Assign address 1 to the pump
+        send_and_listen(
+            ser_pump, "1~1", 1, 2, s_name + "p"
+        )  # Configure independent channel control, pump 1
+
+        # Set run direction: J = CW, K = CCW
+        send_and_listen(ser_pump, "2K", 1, 2, s_name + "p")  # CCW
+        send_and_listen(ser_pump, "4J", 1, 2, s_name + "p")  # CW
+
+        # Set mode: Time
+        send_and_listen(ser_pump, "2N", 1, 2, s_name + "p")  # Time mode
+        send_and_listen(ser_pump, "4N", 1, 2, s_name + "p")  # Time mode
+
+        # Set RPM outside of RPM mode: 6, 0.01RPM
+        send_and_listen(ser_pump, "2xf006000", 1, 2, s_name + "p")  # RPM
+        send_and_listen(ser_pump, "4xf000600", 1, 2, s_name + "p")  # RPM
+
+        # Set run time: Time Type 1: 1-8, 0.1 sec
+        send_and_listen(ser_pump, "2xT50", 1, 2, s_name + "p")  # RPM
+        send_and_listen(ser_pump, "4xT50", 1, 2, s_name + "p")  # RPM
+
+        ## Run pumps
+        send_command(ser_pump, "2H")
+        send_and_listen(ser_pump, "4H", 2, 5, s_name + "p")
+
+        ## Reset stages
+        send_command(ser_ls_z, f"<goto {z_retract} {z_s_approach}")
+        send_command(ser_ls_x, f"<goto {x_retract}>")
+        send_command(ser_ls_y, f"<goto {y_retract}>")
+
+        time.sleep(
+            max(
+                abs(z_measure - z_retract) / z_s_approach,
+                abs(x_measure - x_retract) / LS_SPEED_DEFAULT,
+                abs(y_measure - y_retract) / LS_SPEED_DEFAULT,
+            )
+        )
+
+        print(s_name + "Successful!")
+
+    finally:
+        print(s_name + "exited")
+
+
 def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
     """Demo 2025-02-03: Move linear stage, run pump, move stage back"""
 
+    s_name = "(demo) "
     try:
         if not all([check_port(serial_ports, key) for key in ("p", "z")]):
             print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
@@ -140,7 +241,6 @@ def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args)
 
         timeout_home = 10
         timeout_move = dist / LS_SPEED_DEFAULT
-        s_name = "(demo) "
 
         send_and_listen(ser_ls_z, "<home>", 2, timeout_home, s_name + "z")
         send_and_listen(ser_pump, "@1", 1, 2, s_name + "p")
@@ -156,6 +256,7 @@ def script_demo(serial_ports: dict[str, serial.Serial], active_port_keys, *args)
 
 def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
     """Move the linear stage back and forth"""
+    s_name = "(wiggle_ls) "
     try:
         port_code = args[0]
         dist = int(args[1])
@@ -163,7 +264,6 @@ def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *
             print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
             return
 
-        s_name = "(wiggle_ls) "
         prefix = s_name + port_code
         serial_port = serial_ports[port_code]
 
@@ -185,6 +285,7 @@ def program_exit(*args):
 
 scripts = {
     "demo": script_demo,
+    "demo2": script_demo2,
     "wiggle_ls": script_wiggle_ls,
     "exit": program_exit,
     "quit": program_exit,
