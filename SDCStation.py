@@ -3,28 +3,30 @@ import queue
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from queue import SimpleQueue
 from typing import Concatenate, ParamSpec, final, override
 
+import numpy as np
 import serial
 
 P = ParamSpec("P")  # Represents the parameter types of a function
 
 ## Constants
 VERSION = "0.3"
-ONE_FRAME = 1 / 60  # 0.016666 s
+ONE_FRAME = 1 / 600  # 0.0016666 s
 DEFAULT_SLEEP = 0.1  # s
 DEFAULT_SLEEP_LONG = 1
 LINE_TERMINATION = "\r\n"
 LS_SPEED_DEFAULT = 15  # mm/s Default max speed of linear stage
+INF_INT = 999999
 
 
 @final
 @dataclass(frozen=True)
 class Msg:
-    I_WELCOME = "Welcome to SDC corrosion demo v0.2"
+    I_WELCOME = f"Welcome to SDC corrosion demo v{VERSION}"
     I_KEYBOARD_INTERRUPT = "KeyboardInterrupt: Exiting..."
     I_CLEAN_EXIT = "Clean exit: Closed all ports"
     I_START = "Enter command: "
@@ -159,9 +161,9 @@ class SerialWorker(threading.Thread):
         self.serial_port = serial_port
 
         self.response_queue: SimpleQueue[list[str]] = SimpleQueue()
-        self.command_queue: SimpleQueue[tuple[str, int, float, str, bool]] = (
-            SimpleQueue()
-        )
+        self.command_queue: SimpleQueue[
+            tuple[str, int | None, float | None, str, bool]
+        ] = SimpleQueue()
 
         # Options
         self.line_termination = line_termination
@@ -174,8 +176,8 @@ class SerialWorker(threading.Thread):
     def queue_command(
         self,
         command: str,
-        num_lines: int,
-        timeout: float,
+        num_lines: int | None,
+        timeout: float | None,
         context: str = "",
         print_response: bool = True,
     ):
@@ -216,7 +218,7 @@ class SerialWorker(threading.Thread):
         while self.serial_port.in_waiting > 0:
             old_responses.append(self.serial_port.readline().decode().strip())
 
-        if self.print_old_responses:
+        if self.print_old_responses and len(old_responses) > 0:
             print(f"({context}) {self.device_name}: *** BEGIN OLD RESPONSES")
             for response in old_responses:
                 print(f"({context}) {self.device_name}: {response}")
@@ -265,6 +267,8 @@ class SerialController:
         self.response_check_period = response_check_period
         self.num_expected_responses = 0
 
+        self.context: str | None = None
+
     def start(self):
         """Start all worker threads"""
         for worker in self.workers.values():
@@ -276,12 +280,17 @@ class SerialController:
         self,
         device_name: str,
         command: str,
-        num_lines: int,
-        timeout: float,
-        context: str,
+        num_lines: int | None,
+        timeout: float | None,
+        context: str | None = None,
         print_response: bool = True,
     ):
         """Prepare a command to be sent to a SerialWorker"""
+        if context is None:
+            if self.context is None:
+                raise ValueError("Context is None, and SerialController has context")
+            context = self.context
+
         if device_name in self.workers:
             # TODO: This is perhaps redundant. Can simply put onto the queue directly
             self.workers[device_name].queue_command(
@@ -300,7 +309,8 @@ class SerialController:
     def execute_queued_commands(self) -> dict[str, list[list[str]]]:
         """Signals all workers to start processing their respective command queues"""
         for worker in self.workers.values():
-            worker.process_command_queue()
+            if worker.command_queue.qsize() > 0:
+                worker.process_command_queue()
 
         # while sum of length of response queues is less than expected: wait
         while (
@@ -320,6 +330,14 @@ class SerialController:
             responses[worker_name] = worker_responses
 
         return responses
+
+    def enter_context(self, context: str):
+        """set up new context"""
+        self.context = context
+
+    def exit_context(self):
+        """Uninitializes context"""
+        self.context = None
 
     def stop_workers(self) -> None:
         """Stops all worker threads"""
@@ -343,7 +361,10 @@ class SerialController:
 
 
 def script_demo2_refactored(
-    serial_ports: dict[str, serial.Serial], active_port_keys: list[str], *_
+    serial_ports: dict[str, serial.Serial],
+    active_port_keys: list[str],
+    control: SerialController,
+    *_,
 ):
     """Demo2 using SerialController"""
     s_name = "demo2"
@@ -352,6 +373,8 @@ def script_demo2_refactored(
             print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
             return
 
+        control.enter_context(s_name)
+
         timeout_home = 18
 
         x_retract = 0
@@ -359,19 +382,156 @@ def script_demo2_refactored(
         z_retract = 0  # or 100?
 
         x_measure = 200
-        y_measure = 85
-        z_measure = 50
+        y_measure = 95
+        z_measure = 60
+        z_premeasure_offset = 15
+        z_premeasure = z_measure - z_premeasure_offset
 
-        z_s_approach = 5
+        # z_s_approach = 5
+
+        ## "Home" the stages
+        control.queue_command("x", "<home>", 2, None)
+        control.queue_command("y", "<home>", 2, None)
+        control.queue_command("z", "<home>", 2, None)
+        _ = control.execute_queued_commands()
+
+        ## Move stages into retracted position
+        control.queue_command(
+            "x",
+            f"<goto {x_retract}>",
+            None,
+            x_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
+        )
+        control.queue_command(
+            "y",
+            f"<goto {y_retract}>",
+            None,
+            y_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
+        )
+        control.queue_command(
+            "z",
+            f"<goto {z_retract}>",
+            None,
+            z_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
+        )
+        # time.sleep(DEFAULT_SLEEP_LONG)
+        _ = control.execute_queued_commands()
+
+        ## Move sample into position and configure pumps
+        # Synchronize by changing speeds to arrive at the same time
+        x_move_dist = abs(x_measure - x_retract)
+        y_move_dist = abs(y_measure - y_retract)
+        z_move_dist = abs(z_premeasure - z_retract)
+        time_move_sample_to_measure = (
+            max(x_move_dist, y_move_dist, z_move_dist) / LS_SPEED_DEFAULT
+        )
+        x_speed = x_move_dist / time_move_sample_to_measure
+        y_speed = y_move_dist / time_move_sample_to_measure
+        z_speed = z_move_dist / time_move_sample_to_measure
+        z_s_approach = z_speed / 1  # /2
+
+        # Move all stages
+        control.queue_command(
+            "x",
+            f"<goto {x_measure} {x_speed}>",
+            None,
+            time_move_sample_to_measure,
+        )
+        control.queue_command(
+            "y",
+            f"<goto {y_measure} {y_speed}>",
+            None,
+            time_move_sample_to_measure,
+        )
+        control.queue_command(
+            "z",
+            f"<goto {z_premeasure} {z_speed}>",
+            None,
+            time_move_sample_to_measure,
+        )
+        # Move z into final position and wait to settle
+        control.queue_command(
+            "z",
+            f"<goto {z_measure} {z_s_approach}>",
+            None,
+            z_premeasure_offset / z_s_approach + DEFAULT_SLEEP_LONG,
+            s_name,
+        )
+
+        # Configure pump
+        P_RETURN = 2
+        P_SEND = 4
+        P_CW = "J"
+        P_CCW = "K"
+        P_MODE_TIME = "N"
+        P_SET_RPM = "S"
+        P_SET_RUNTIME = "V"
+        P_START = "H"
+        RPM = 30
+        RPM_DT3 = f"{RPM * 100:06d}"  # Discrete Type 3: width=6 0.01RPM
+        RUNTIME = 15  # seconds
+        RUNTIME_TT2 = f"{RUNTIME * 10:04d}"  # Time Type 2: width=4, 0.1 sec
+
+        control.queue_command("p", "@1", 1, None)
+        control.queue_command("p", "1~1", 1, None)
+        # Run channel send CCW, fast, 5 seconds
+        # Run channel return CW, slowly, 5 seconds
+        control.queue_command("p", f"{P_SEND}{P_CCW}", 1, None)
+        control.queue_command("p", f"{P_RETURN}{P_CW}", 1, None)
+        # Set mode: Time
+        control.queue_command("p", f"{P_SEND}{P_MODE_TIME}", 1, None)
+        control.queue_command("p", f"{P_RETURN}{P_MODE_TIME}", 1, None)
+        # Set RPM mode flow rate setting
+        control.queue_command("p", f"{P_SEND}{P_SET_RPM}{RPM_DT3}", 1, None)
+        control.queue_command("p", f"{P_RETURN}{P_SET_RPM}{RPM_DT3}", 1, None)
+        # Set run time
+        control.queue_command("p", f"{P_SEND}{P_SET_RUNTIME}{RUNTIME_TT2}", 1, None)
+        control.queue_command("p", f"{P_RETURN}{P_SET_RUNTIME}{RUNTIME_TT2}", 1, None)
+
+        _ = control.execute_queued_commands()
+
+        ## Run pumps
+        control.queue_command("p", f"{P_SEND}{P_START}", 0, None)
+        control.queue_command(
+            "p", f"{P_RETURN}{P_START}", None, RUNTIME + DEFAULT_SLEEP_LONG
+        )
+        _ = control.execute_queued_commands()
+
+        # Disenage head (z stage)
+        control.queue_command(
+            "z",
+            f"<goto {z_premeasure} {z_s_approach}>",
+            None,
+            z_premeasure_offset / z_s_approach + DEFAULT_SLEEP_LONG,
+        )
+        _ = control.execute_queued_commands()
+
+        ## Reset stages
+        control.queue_command(
+            "x", f"<goto {x_retract} {x_speed}>", None, time_move_sample_to_measure
+        )
+        control.queue_command(
+            "y", f"<goto {y_retract} {y_speed}>", None, time_move_sample_to_measure
+        )
+        control.queue_command(
+            "z", f"<goto {z_retract} {z_speed}>", None, time_move_sample_to_measure
+        )
+        _ = control.execute_queued_commands()
+
+        print(f"({s_name}) Successful!")
 
     finally:
+        control.exit_context()
         print(f"({s_name}) exited")
     # try:
     #     if not all([check_])
 
 
 def script_demo2(
-    serial_ports: dict[str, serial.Serial], active_port_keys: list[str], *_
+    serial_ports: dict[str, serial.Serial],
+    active_port_keys: list[str],
+    serial_controller,
+    *_,
 ):
     """Demo 2025-02-20: Move linear stage, run pump, move stage back"""
     s_name = "(demo2) "
@@ -496,7 +656,10 @@ def script_demo2(
 
 
 def script_demo(
-    serial_ports: dict[str, serial.Serial], active_port_keys: list[str], *args
+    serial_ports: dict[str, serial.Serial],
+    active_port_keys: list[str],
+    serial_controller: SerialController,
+    *args,
 ):
     """Demo 2025-02-03: Move linear stage, run pump, move stage back"""
 
@@ -525,7 +688,12 @@ def script_demo(
         print(s_name + "Exited")
 
 
-def script_wiggle_ls(serial_ports: dict[str, serial.Serial], active_port_keys, *args):
+def script_wiggle_ls(
+    serial_ports: dict[str, serial.Serial],
+    active_port_keys: list[str],
+    serial_controller: SerialController,
+    *args,
+):
     """Move the linear stage back and forth"""
     s_name = "(wiggle_ls) "
     try:
@@ -588,13 +756,17 @@ def send_command(serial_port: serial.Serial, command: str):
 
 def listen_for(
     serial_port: serial.Serial,
-    number_of_lines: int,
-    timeout: float,
+    number_of_lines: int | None,
+    timeout: float | None,
     print_lines: bool = True,
     prefix: str = "",
     read_period: float = ONE_FRAME,
 ) -> list[str]:
     """Read a specified number of lines with a timeout from serial"""
+    if number_of_lines is None:
+        number_of_lines = INF_INT
+    if timeout is None:
+        timeout = np.inf
 
     start_time = time.time()
 
@@ -613,8 +785,8 @@ def listen_for(
 def send_and_listen(
     serial_port: serial.Serial,
     command: str,
-    number_of_lines: int,
-    timeout: float,
+    number_of_lines: int | None,
+    timeout: float | None,
     prefix: str = "",
     print_lines: bool = True,
     read_period: float = ONE_FRAME,
@@ -685,6 +857,7 @@ def setup() -> tuple[StoppableThread, SerialController]:
         {device_name: SERIAL_PORTS[device_name] for device_name in ACTIVE_PORT_KEYS},
         response_check_period=ONE_FRAME,
     )
+    serial_controller.start()
 
     return listener_thread, serial_controller
 
@@ -729,37 +902,42 @@ def main():
             user_input = user_input.strip()
 
             # Invalid input
-            if len(user_input) < 1:
+            if len(user_input) < 2:
                 print(Msg.E_INPUT_NOT_VALID)
+                continue
 
             # get input code
             input_code = user_input[0].lower()
 
             # If input_code is a valid active port: Send commands directly
-            if input_code in ACTIVE_PORT_KEYS and user_input[1] == ":":
+            if input_code in SERIAL_PORTS and user_input[1] == ":":
                 user_input_list = user_input.split(";")
 
-                for p_user_input in user_input_list:
-                    if not check_port(SERIAL_PORTS, p_user_input[0].lower()):
-                        raise LookupError(Msg.E_PORT_NOT_AVAILABLE)
-                    if p_user_input[1] != ":":
-                        raise ValueError(Msg.E_INPUT_NOT_VALID)
+                try:
+                    for p_user_input in user_input_list:
+                        # Check that all ports are active
+                        if not check_port(SERIAL_PORTS, p_user_input[0].lower()):
+                            print(Msg.E_PORT_NOT_AVAILABLE)
+                            raise LookupError
 
+                        # Check that each command is formatted correctly
+                        if p_user_input[1] != ":":
+                            print(Msg.E_INPUT_NOT_VALID)
+                            raise ValueError
+
+                except (ValueError, LookupError) as _:
+                    # Return to prompt
+                    continue
+
+                # If no issues, send all commands
                 for p_user_input in user_input_list:
                     p_input_code = p_user_input[0].lower()
                     ser_port = SERIAL_PORTS[p_input_code]
                     send_command(ser_port, p_user_input[2:])
 
-                # # Check that the port is open
-                # if check_port(SERIAL_PORTS, input_code):
-                #     ser_port = SERIAL_PORTS[input_code]
-                #     send_command(ser_port, user_input[2:])
-                # else:
-                #     raise LookupError(Msg.E_PORT_NOT_AVAILABLE)
-
             # If input_code is valid but port is not configured: Inform user
-            elif input_code in SERIAL_PORTS and user_input[1] == ":":
-                print(Msg.E_SERIAL_PORT_NOT_REGISTERED)
+            # elif input_code in SERIAL_PORTS and user_input[1] == ":":
+            #     print(Msg.E_SERIAL_PORT_NOT_REGISTERED)
 
             # Otherwise, input must either be a script or invalid
             else:
@@ -770,7 +948,12 @@ def main():
                 if keyword in scripts:
                     try:
                         listener_thread.pause()
-                        scripts[keyword](SERIAL_PORTS, ACTIVE_PORT_KEYS, *arguments)
+                        scripts[keyword](
+                            SERIAL_PORTS,
+                            ACTIVE_PORT_KEYS,
+                            serial_controller,
+                            *arguments,
+                        )
 
                     finally:
                         listener_thread.resume()
