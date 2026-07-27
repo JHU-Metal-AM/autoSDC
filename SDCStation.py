@@ -10,6 +10,7 @@ from typing import Concatenate, ParamSpec, final, override
 
 import numpy as np
 import serial
+from scripts import SCRIPT_REGISTRY, load_script_by_id
 
 P = ParamSpec("P")  # Represents the parameter types of a function
 
@@ -360,173 +361,6 @@ class SerialController:
 ## Scripts
 
 
-def script_demo2_refactored(
-    serial_ports: dict[str, serial.Serial],
-    active_port_keys: list[str],
-    control: SerialController,
-    *_,
-):
-    """Demo2 using SerialController"""
-    s_name = "demo2"
-    try:
-        if not check_ports(serial_ports, ["x", "y", "z", "p"]):
-            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
-            return
-
-        control.enter_context(s_name)
-
-        timeout_home = 18
-
-        x_retract = 0
-        y_retract = 0
-        z_retract = 0  # or 100?
-
-        x_measure = 200
-        y_measure = 95
-        z_measure = 60
-        z_premeasure_offset = 15
-        z_premeasure = z_measure - z_premeasure_offset
-
-        # z_s_approach = 5
-
-        ## "Home" the stages
-        control.queue_command("x", "<home>", 2, None)
-        control.queue_command("y", "<home>", 2, None)
-        control.queue_command("z", "<home>", 2, None)
-        _ = control.execute_queued_commands()
-
-        ## Move stages into retracted position
-        control.queue_command(
-            "x",
-            f"<goto {x_retract}>",
-            None,
-            x_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
-        )
-        control.queue_command(
-            "y",
-            f"<goto {y_retract}>",
-            None,
-            y_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
-        )
-        control.queue_command(
-            "z",
-            f"<goto {z_retract}>",
-            None,
-            z_retract / LS_SPEED_DEFAULT + DEFAULT_SLEEP,
-        )
-        # time.sleep(DEFAULT_SLEEP_LONG)
-        _ = control.execute_queued_commands()
-
-        ## Move sample into position and configure pumps
-        # Synchronize by changing speeds to arrive at the same time
-        x_move_dist = abs(x_measure - x_retract)
-        y_move_dist = abs(y_measure - y_retract)
-        z_move_dist = abs(z_premeasure - z_retract)
-        time_move_sample_to_measure = (
-            max(x_move_dist, y_move_dist, z_move_dist) / LS_SPEED_DEFAULT
-        )
-        x_speed = x_move_dist / time_move_sample_to_measure
-        y_speed = y_move_dist / time_move_sample_to_measure
-        z_speed = z_move_dist / time_move_sample_to_measure
-        z_s_approach = z_speed / 1  # /2
-
-        # Move all stages
-        control.queue_command(
-            "x",
-            f"<goto {x_measure} {x_speed}>",
-            None,
-            time_move_sample_to_measure,
-        )
-        control.queue_command(
-            "y",
-            f"<goto {y_measure} {y_speed}>",
-            None,
-            time_move_sample_to_measure,
-        )
-        control.queue_command(
-            "z",
-            f"<goto {z_premeasure} {z_speed}>",
-            None,
-            time_move_sample_to_measure,
-        )
-        # Move z into final position and wait to settle
-        control.queue_command(
-            "z",
-            f"<goto {z_measure} {z_s_approach}>",
-            None,
-            z_premeasure_offset / z_s_approach + DEFAULT_SLEEP_LONG,
-            s_name,
-        )
-
-        # Configure pump
-        P_RETURN = 2
-        P_SEND = 4
-        P_CW = "J"
-        P_CCW = "K"
-        P_MODE_TIME = "N"
-        P_SET_RPM = "S"
-        P_SET_RUNTIME = "V"
-        P_START = "H"
-        RPM = 30
-        RPM_DT3 = f"{RPM * 100:06d}"  # Discrete Type 3: width=6 0.01RPM
-        RUNTIME = 15  # seconds
-        RUNTIME_TT2 = f"{RUNTIME * 10:04d}"  # Time Type 2: width=4, 0.1 sec
-
-        control.queue_command("p", "@1", 1, None)
-        control.queue_command("p", "1~1", 1, None)
-        # Run channel send CCW, fast, 5 seconds
-        # Run channel return CW, slowly, 5 seconds
-        control.queue_command("p", f"{P_SEND}{P_CCW}", 1, None)
-        control.queue_command("p", f"{P_RETURN}{P_CW}", 1, None)
-        # Set mode: Time
-        control.queue_command("p", f"{P_SEND}{P_MODE_TIME}", 1, None)
-        control.queue_command("p", f"{P_RETURN}{P_MODE_TIME}", 1, None)
-        # Set RPM mode flow rate setting
-        control.queue_command("p", f"{P_SEND}{P_SET_RPM}{RPM_DT3}", 1, None)
-        control.queue_command("p", f"{P_RETURN}{P_SET_RPM}{RPM_DT3}", 1, None)
-        # Set run time
-        control.queue_command("p", f"{P_SEND}{P_SET_RUNTIME}{RUNTIME_TT2}", 1, None)
-        control.queue_command("p", f"{P_RETURN}{P_SET_RUNTIME}{RUNTIME_TT2}", 1, None)
-
-        _ = control.execute_queued_commands()
-
-        ## Run pumps
-        control.queue_command("p", f"{P_SEND}{P_START}", 0, None)
-        control.queue_command(
-            "p", f"{P_RETURN}{P_START}", None, RUNTIME + DEFAULT_SLEEP_LONG
-        )
-        _ = control.execute_queued_commands()
-
-        # Disenage head (z stage)
-        control.queue_command(
-            "z",
-            f"<goto {z_premeasure} {z_s_approach}>",
-            None,
-            z_premeasure_offset / z_s_approach + DEFAULT_SLEEP_LONG,
-        )
-        _ = control.execute_queued_commands()
-
-        ## Reset stages
-        control.queue_command(
-            "x", f"<goto {x_retract} {x_speed}>", None, time_move_sample_to_measure
-        )
-        control.queue_command(
-            "y", f"<goto {y_retract} {y_speed}>", None, time_move_sample_to_measure
-        )
-        control.queue_command(
-            "z", f"<goto {z_retract} {z_speed}>", None, time_move_sample_to_measure
-        )
-        _ = control.execute_queued_commands()
-
-        print(f"({s_name}) Successful!")
-
-    finally:
-        control.exit_context()
-        print(f"({s_name}) exited")
-    # try:
-    #     if not all([check_])
-
-
 def script_demo2(
     serial_ports: dict[str, serial.Serial],
     active_port_keys: list[str],
@@ -654,81 +488,6 @@ def script_demo2(
     finally:
         print(s_name + "exited")
 
-
-def script_demo(
-    serial_ports: dict[str, serial.Serial],
-    active_port_keys: list[str],
-    serial_controller: SerialController,
-    *args,
-):
-    """Demo 2025-02-03: Move linear stage, run pump, move stage back"""
-
-    s_name = "(demo) "
-    try:
-        if not all([check_port(serial_ports, key) for key in ("p", "z")]):
-            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
-            return
-
-        dist = int(args[0])
-        ser_ls_z = serial_ports["z"]
-        ser_pump = serial_ports["p"]
-
-        timeout_home = 10
-        timeout_move = dist / LS_SPEED_DEFAULT
-
-        send_and_listen(ser_ls_z, "<home>", 2, timeout_home, s_name + "z")
-        send_and_listen(ser_pump, "@1", 1, 2, s_name + "p")
-        send_and_listen(ser_ls_z, f"<move {dist}>", 2, timeout_move, s_name + "z")
-        send_and_listen(ser_pump, "4H", 2, 5, s_name + "p")
-        send_and_listen(ser_ls_z, f"<move -{dist}>", 2, timeout_move, s_name + "z")
-
-        print(s_name + "Successful!")
-
-    finally:
-        print(s_name + "Exited")
-
-
-def script_wiggle_ls(
-    serial_ports: dict[str, serial.Serial],
-    active_port_keys: list[str],
-    serial_controller: SerialController,
-    *args,
-):
-    """Move the linear stage back and forth"""
-    s_name = "(wiggle_ls) "
-    try:
-        port_code = args[0]
-        dist = int(args[1])
-        if not check_port(serial_ports, port_code):
-            print(Msg.E_SCRIPT_REQUIRED_PORT_NOT_ACTIVE)
-            return
-
-        prefix = s_name + port_code
-        serial_port = serial_ports[port_code]
-
-        timeout = dist / LS_SPEED_DEFAULT
-
-        send_and_listen(serial_port, f"<move {dist}>", 2, timeout, prefix)
-        send_and_listen(serial_port, f"<move -{dist}>", 2, timeout, prefix)
-
-        print(s_name + f"Wiggled {port_code} {dist}mm !")
-
-    finally:
-        print(s_name + "Exited")
-
-
-def program_exit(*_):
-    """Exit the program"""
-    sys.exit()
-
-
-scripts: dict[str, Callable[..., None]] = {
-    "demo": script_demo,
-    "demo2": script_demo2_refactored,
-    "wiggle_ls": script_wiggle_ls,
-    "exit": program_exit,
-    "quit": program_exit,
-}
 
 ## Functions
 
@@ -945,10 +704,14 @@ def main():
                 keyword = user_input_list[0]
                 arguments = user_input_list[1:]
 
-                if keyword in scripts:
+                if keyword in SCRIPT_REGISTRY:
+                    script_function = load_script_by_id(keyword)
+                    if script_function is None:
+                        continue
+
                     try:
                         listener_thread.pause()
-                        scripts[keyword](
+                        script_function(
                             SERIAL_PORTS,
                             ACTIVE_PORT_KEYS,
                             serial_controller,
@@ -965,7 +728,7 @@ def main():
 
     except KeyboardInterrupt:
         print("")
-        program_exit()
+        sys.exit()
 
     finally:
         clean_up(SERIAL_PORTS, ACTIVE_PORT_KEYS, listener_thread, serial_controller)
