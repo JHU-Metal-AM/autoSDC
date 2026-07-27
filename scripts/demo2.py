@@ -145,7 +145,7 @@ def script_demo2_refactored(
         )
         _ = control.execute_queued_commands()
 
-        # Disenage head (z stage)
+        # Disengage head (z stage)
         control.queue_command(
             "z",
             f"<goto {z_premeasure} {z_s_approach}>",
