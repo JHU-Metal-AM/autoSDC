@@ -16,7 +16,7 @@ def script_demo2_refactored(
     control: SerialController,
     *_,
 ):
-    """Demo2 using SerialController"""
+    """Demo 2025-02-20: home/move stages, run pump sequence, then reset."""
     _ = active_port_keys
 
     station = get_station_module()
