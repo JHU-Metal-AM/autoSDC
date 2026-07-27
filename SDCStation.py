@@ -884,7 +884,7 @@ def clean_up(
 
     # Close serial ports
     for port_code in active_ports:
-        serial_ports[port_code].close
+        serial_ports[port_code].close()
 
 
 def main():
