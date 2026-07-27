@@ -6,3 +6,6 @@ Developed and tested on Python 3.12
 - Connect the hardware to your computer
 - Identify the serial ports assigned by your system to each device (`COM` ports on Windows, `/dev/ttyXXXY` devices on Mac/Linux) and set each serial port to the correct device in the script
 - Run `python autoSDC.py`!
+
+## Script layout
+- Scenario scripts now live under `/scripts` and are loaded at runtime by script id (`demo`, `demo2`, `wiggle_ls`, `exit`, `quit`).
